@@ -1,0 +1,16 @@
+{
+  "name": "ruler-mcp",
+  "version": "1.0.0",
+  "description": "RULER MCP \u2014 Price floor tools (ActiveView + TN Price Monitor) via JSON-RPC \u2014 MBOLIVEIRAZ MEDIA & TECH",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
