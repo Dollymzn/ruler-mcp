@@ -15,7 +15,6 @@ const path = require("path");
 const fs = require("fs");
 const { DatabaseSync } = require("node:sqlite");
 const { getRules, upsertRules } = require("./activeview");
-const { hasEventsSource, listSites, recentEvents, floorStats } = require("./events");
 
 const PORT = process.env.PORT || 8080;
 const MCP_TOKENS = (process.env.RULER_MCP_TOKENS || "")
@@ -64,39 +63,6 @@ const TOOLS = [
     },
   },
   {
-    name: "performance_floors",
-    description:
-      "Fill rate real por price floor, vindo dos eventos do TN Price Monitor (SQLite). Agrupa em blocos (uri+país+device+utm) com cascata de floors aninhada: total, filled, unfilled, match% e duração média de sessão por floor. Use pra saber qual floor está enchendo (fill) e qual está segurando demais.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        site: { type: "string", description: "Site (ex: blog.hakatt.com). Opcional — sem ele, agrega tudo." },
-        hours: { type: "number", description: "Janela em horas pra trás (ex: 24). Opcional." },
-        sort: { type: "string", enum: ["sessions", "fill", "match", "total"], description: "Ordenação dos blocos (default sessions)" },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "eventos_recentes",
-    description:
-      "Últimos N eventos brutos do TN Price Monitor (slot_filled/slot_unfilled) com site, uri, país, device, price_rule, sessão. Use pra depurar coleta ou inspecionar comportamento recente.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        site: { type: "string", description: "Filtrar por site. Opcional." },
-        limit: { type: "number", description: "Quantidade (1-500, default 50)" },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "listar_sites_monitorados",
-    description:
-      "Lista os sites que têm eventos no TN Price Monitor, com contagem. Use pra descobrir quais blogs estão coletando dados de floor.",
-    inputSchema: { type: "object", properties: {}, required: [] },
-  },
-  {
     name: "historico_ajustes",
     description:
       "Histórico de mudanças de floor feitas via este MCP (quem, quando, o quê, snapshot anterior). Use pra auditar o que foi alterado e correlacionar com mudanças de receita.",
@@ -107,6 +73,20 @@ const TOOLS = [
         limit: { type: "number", description: "Quantidade (default 50)" },
       },
       required: [],
+    },
+  },
+  {
+    name: "resumo_floors",
+    description:
+      "Visão agregada das price rules de um domínio: revenue total, impressões totais, eCPM médio ponderado por impressões, contagem de regras (ativas/inativas), top regras por revenue, e REGRAS PROBLEMÁTICAS (match_rate muito fora do desired, revenue zerado com impressões altas, floors extremos). Use como primeiro passo antes de mergulhar em listar_price_rules — dá o panorama da monetização do domínio numa chamada.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        network: { type: "string", description: "Network ID (ex: código GAM da conta)" },
+        domain: { type: "string", description: "Domínio do blog (ex: blog.hakatt.com)" },
+        av_bearer: { type: "string", description: "Token da ActiveView do gestor" },
+      },
+      required: ["network", "domain", "av_bearer"],
     },
   },
   {
@@ -155,25 +135,6 @@ async function runTool(name, args) {
       return { status: "success", data: rules, count: rules.length };
     }
 
-    case "performance_floors": {
-      if (!hasEventsSource()) return { status: "error", error: "RULER_APP_URL não configurada" };
-      const since = args.hours ? Date.now() - args.hours * 3600_000 : undefined;
-      const stats = await floorStats(args.site, since, args.sort || "sessions");
-      return { status: "success", data: stats };
-    }
-
-    case "eventos_recentes": {
-      if (!hasEventsSource()) return { status: "error", error: "RULER_APP_URL não configurada" };
-      const events = await recentEvents(args.site, args.limit || 50);
-      return { status: "success", data: events, count: events.length };
-    }
-
-    case "listar_sites_monitorados": {
-      if (!hasEventsSource()) return { status: "error", error: "RULER_APP_URL não configurada" };
-      const sites = await listSites();
-      return { status: "success", data: sites };
-    }
-
     case "historico_ajustes": {
       const lim = Math.min(Math.max(parseInt(args.limit) || 50, 1), 500);
       let rows;
@@ -190,6 +151,60 @@ async function runTool(name, args) {
         prev_snapshot: safeParse(r.prev_snapshot),
       }));
       return { status: "success", data, count: data.length };
+    }
+
+    case "resumo_floors": {
+      const rules = await getRules(args.network, args.domain, args.av_bearer);
+      const ativas = rules.filter((r) => r.enabled !== false && r.enabled !== 0);
+      const totRevenue = ativas.reduce((s, r) => s + (parseFloat(r.revenue) || 0), 0);
+      const totImps = ativas.reduce((s, r) => s + (parseInt(r.impressions) || 0), 0);
+      const ecpmPonderado = totImps > 0
+        ? +(ativas.reduce((s, r) => s + (parseFloat(r.ecpm) || 0) * (parseInt(r.impressions) || 0), 0) / totImps).toFixed(2)
+        : 0;
+
+      const topRevenue = [...ativas]
+        .sort((a, b) => (parseFloat(b.revenue) || 0) - (parseFloat(a.revenue) || 0))
+        .slice(0, 10)
+        .map((r) => ({
+          rule: r.rule, country: r.country, device: r.device,
+          request_uri: r.request_uri, utm_source: r.utm_source,
+          revenue: r.revenue, ecpm: r.ecpm, impressions: r.impressions,
+          match_rate: r.match_rate, desired_match_rate: r.desired_match_rate,
+        }));
+
+      const problematicas = [];
+      for (const r of ativas) {
+        const match = parseFloat(r.match_rate) || 0;
+        const desired = parseFloat(r.desired_match_rate) || 0;
+        const imps = parseInt(r.impressions) || 0;
+        const rev = parseFloat(r.revenue) || 0;
+        const ident = {
+          rule: r.rule, country: r.country, device: r.device,
+          request_uri: r.request_uri, utm_source: r.utm_source,
+          match_rate: match, desired_match_rate: desired,
+          impressions: imps, revenue: rev, ecpm: r.ecpm,
+        };
+        if (desired > 0 && imps >= 100 && match > desired * 1.2)
+          problematicas.push({ ...ident, problema: "match muito ACIMA do desired — floor provavelmente baixo, dinheiro na mesa" });
+        else if (desired > 0 && imps >= 100 && match < desired * 0.6)
+          problematicas.push({ ...ident, problema: "match muito ABAIXO do desired — floor segurando fill" });
+        else if (imps >= 500 && rev === 0)
+          problematicas.push({ ...ident, problema: "impressões altas com revenue ZERO — investigar" });
+      }
+
+      return {
+        status: "success",
+        data: {
+          domain: args.domain,
+          total_regras: rules.length,
+          regras_ativas: ativas.length,
+          revenue_total: +totRevenue.toFixed(2),
+          impressoes_totais: totImps,
+          ecpm_medio_ponderado: ecpmPonderado,
+          top_10_por_revenue: topRevenue,
+          regras_problematicas: problematicas,
+        },
+      };
     }
 
     case "sugerir_floor": {
@@ -351,7 +366,7 @@ app.post("/api/mcp", async (req, res) => {
 
 // health
 app.get("/health", (req, res) =>
-  res.json({ ok: true, service: "ruler-mcp", eventsSource: hasEventsSource() })
+  res.json({ ok: true, service: "ruler-mcp", focus: "price-rules" })
 );
 
 app.listen(PORT, () => {
@@ -365,6 +380,5 @@ app.listen(PORT, () => {
   console.log(`  MBOLIVEIRAZ MEDIA & TECH — ruler-mcp na porta ${PORT}`);
   console.log(`  Endpoint MCP:  POST /api/mcp`);
   console.log(`  Tools:         ${TOOLS.length}`);
-  console.log(`  Events via:    ${hasEventsSource() ? "RULER HTTP (" + process.env.RULER_APP_URL + ")" : "AUSENTE (configure RULER_APP_URL)"}`);
-  console.log("");
+    console.log("");
 });
